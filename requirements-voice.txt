@@ -1,0 +1,6 @@
+# 可选：语音识别依赖
+# 安装：python -m pip install -r requirements-voice.txt
+# 非 16kHz 单声道 WAV/PCM 音频还需要系统提供 ffmpeg。
+
+baidu-aip>=4.16.13
+alibabacloud-nls-python-sdk>=1.0.2
