@@ -2,6 +2,10 @@
 
 基于 FastAPI + ChromaDB + MySQL 的企业级 RAG 知识库问答系统，支持多模态文档解析、混合检索、Cross-Encoder 重排序、多轮对话改写与 RAGAS 评估体系。
 
+GitHub 仓库：[yan1banzhuan/rag-knowledge-base](https://github.com/yan1banzhuan/rag-knowledge-base)
+
+首次上传、后续推送和密钥安全说明请阅读：[GitHub从零上传指南.md](./GitHub从零上传指南.md)。
+
 ## 系统架构
 
 ```

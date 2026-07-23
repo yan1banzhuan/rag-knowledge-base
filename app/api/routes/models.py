@@ -1,3 +1,35 @@
+# =============================================================================
+# 文件作用与架构位置（大模型 Provider 配置路由）
+# =============================================================================
+# 本文件向管理界面提供 LLM Provider 的配置列表、连通性测试、保存和重置接口。数据库
+# 配置优先于 .env；删除数据库配置后，服务层会重新回退到环境变量默认值。
+#
+# 本文件共有 13 个函数：
+#
+#   _mask()                   对 API Key/Secret 脱敏
+#   _is_configured()          判断必要凭证是否填写
+#   _build_out()              构造安全的响应模型
+#   list_models()             列出全部受支持 Provider
+#   test_model_connection()   连通性测试路由
+#   _test_connection()        按 Provider 分派测试函数
+#   _test_openai_like()       测试 OpenAI/DeepSeek 兼容接口
+#   _test_dashscope()         测试阿里云 DashScope
+#   _test_qianfan()           测试百度千帆
+#   _test_ollama()            测试本地 Ollama
+#   _test_lmstudio()          测试本地 LM Studio
+#   upsert_model_config()     新增或更新数据库配置
+#   delete_model_config()     删除数据库配置并恢复 .env 回退
+#
+#   前端模型配置页
+#          |
+#          +--> GET  /models            安全展示配置
+#          +--> POST /models/{p}/test   实际网络测试
+#          +--> PUT  /models/{p}        保存并清缓存
+#          +--> DELETE /models/{p}      删除并清缓存
+#
+# API 凭证只会脱敏返回，完整值仍只保存在数据库或服务器环境变量中。
+# =============================================================================
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -10,10 +42,12 @@ from app.core.logger import logger
 
 router = APIRouter(prefix="/models", tags=["模型管理"])
 
+# 这是前端和后端共同认可的 Provider 白名单，防止任意路径值进入配置流程。
 PROVIDERS = ["openai", "deepseek", "dashscope", "qianfan", "ollama", "lmstudio"]
 
 
 def _mask(val: str) -> str:
+    # 短值完全隐藏；长值只显示前后 4 位，便于管理员辨认但不泄露完整密钥。
     if not val or len(val) <= 8:
         return "****"
     return val[:4] + "****" + val[-4:]
@@ -22,8 +56,10 @@ def _mask(val: str) -> str:
 def _is_configured(provider: str, cfg: ModelConfig | None) -> bool:
     """判断 provider 是否已填写必要凭证（不测试连通性）"""
     if provider in ("ollama", "lmstudio"):
+        # 本地服务通常不使用云 API Key；这里只判断“配置条件”，不代表服务当前在线。
         return True  # 本地模型无需 key，始终算"已配置"
     if provider in ("openai", "deepseek", "dashscope"):
+        # 优先数据库 cfg；数据库没有值时回退 settings 中的 .env 配置。
         key = (cfg and cfg.api_key) or (
             settings.OPENAI_API_KEY if provider == "openai" else
             settings.DEEPSEEK_API_KEY if provider == "deepseek" else
@@ -40,12 +76,14 @@ def _is_configured(provider: str, cfg: ModelConfig | None) -> bool:
 def _build_out(provider: str, cfg: ModelConfig | None) -> ModelConfigOut:
     """构建脱敏后的 ModelConfigOut，is_available 默认 False（需主动测试）"""
     if cfg is None:
+        # 没有数据库行时仍返回该 Provider，方便前端展示完整配置卡片。
         return ModelConfigOut(
             provider=provider,
             is_enabled=True,
             is_configured=_is_configured(provider, None),
             is_available=False,
         )
+    # api_key/api_secret 必须经过 _mask，不能把数据库原值直接序列化到浏览器。
     return ModelConfigOut(
         id=cfg.id,
         provider=cfg.provider,
@@ -66,6 +104,7 @@ async def list_models(
 ):
     """列出所有 Provider 配置（is_available 默认 False，需调用 test 接口验证）"""
     result = await db.execute(select(ModelConfig))
+    # 列表转换为 {provider: ModelConfig}，之后按固定 PROVIDERS 顺序输出。
     db_configs = {c.provider: c for c in result.scalars().all()}
     data = [_build_out(p, db_configs.get(p)) for p in PROVIDERS]
     return Resp(data=data)
@@ -84,6 +123,7 @@ async def test_model_connection(
     result = await db.execute(select(ModelConfig).where(ModelConfig.provider == provider))
     cfg = result.scalar_one_or_none()
 
+    # 测试函数返回 (是否成功, 给用户看的消息)。测试不会修改配置。
     success, msg = await _test_connection(provider, cfg)
     return Resp(
         data={"provider": provider, "is_available": success, "message": msg},
@@ -94,6 +134,7 @@ async def test_model_connection(
 async def _test_connection(provider: str, cfg: ModelConfig | None) -> tuple[bool, str]:
     """实际发起轻量请求测试连通性"""
     try:
+        # 分派器把统一入口转到各厂商不同的认证和健康检查协议。
         if provider in ("openai", "deepseek"):
             return await _test_openai_like(provider, cfg)
         elif provider == "dashscope":
@@ -106,11 +147,13 @@ async def _test_connection(provider: str, cfg: ModelConfig | None) -> tuple[bool
             return await _test_lmstudio(cfg)
         return False, "未知 Provider"
     except Exception as e:
+        # DNS、超时、JSON 解析等异常统一转成 False，避免测试接口直接返回 500。
         logger.warning(f"[models] {provider} 连接测试异常: {e}")
         return False, str(e)
 
 
 async def _test_openai_like(provider: str, cfg: ModelConfig | None) -> tuple[bool, str]:
+    # OpenAI 官方 SDK 也能连接遵循 OpenAI 协议的 DeepSeek 服务。
     from openai import AsyncOpenAI
     if provider == "deepseek":
         api_key = (cfg and cfg.api_key) or settings.DEEPSEEK_API_KEY
@@ -122,6 +165,7 @@ async def _test_openai_like(provider: str, cfg: ModelConfig | None) -> tuple[boo
     if not api_key:
         return False, "未配置 API Key"
 
+    # 用模型列表接口做轻量测试，10 秒超时避免配置页长时间卡住。
     client = AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=10)
     models = await client.models.list()
     count = len(list(models))
@@ -129,6 +173,7 @@ async def _test_openai_like(provider: str, cfg: ModelConfig | None) -> tuple[boo
 
 
 async def _test_dashscope(cfg: ModelConfig | None) -> tuple[bool, str]:
+    # httpx.AsyncClient 执行异步 HTTP 请求，不阻塞其他 FastAPI 请求。
     import httpx
     api_key = (cfg and cfg.api_key) or settings.DASHSCOPE_API_KEY
     if not api_key:
@@ -157,6 +202,7 @@ async def _test_qianfan(cfg: ModelConfig | None) -> tuple[bool, str]:
             "https://aip.baidubce.com/oauth/2.0/token",
             params={"grant_type": "client_credentials", "client_id": ak, "client_secret": sk},
         )
+    # 千帆使用 AK/SK 先换取 access_token；能取得 token 即说明凭证可用。
     data = resp.json()
     if "access_token" in data:
         return True, "连接成功，Token 获取正常"
@@ -167,6 +213,7 @@ async def _test_ollama(cfg: ModelConfig | None) -> tuple[bool, str]:
     import httpx
     base_url = (cfg and cfg.base_url) or settings.OLLAMA_BASE_URL
     async with httpx.AsyncClient(timeout=10) as client:
+        # rstrip('/') 避免 base_url 末尾斜杠与 /api/tags 拼成双斜杠。
         resp = await client.get(f"{base_url.rstrip('/')}/api/tags")
     if resp.status_code == 200:
         models = resp.json().get("models", [])
@@ -202,10 +249,12 @@ async def upsert_model_config(
     cfg = result.scalar_one_or_none()
 
     if cfg is None:
+        # upsert = update + insert：没有记录就创建，有记录就在原对象上修改。
         cfg = ModelConfig(provider=provider)
         db.add(cfg)
 
     if body.api_key is not None:
+        # None 表示“本次不修改”；空白字符串表示“清除数据库值并允许回退环境变量”。
         cfg.api_key = body.api_key if body.api_key.strip() else None
     if body.api_secret is not None:
         cfg.api_secret = body.api_secret if body.api_secret.strip() else None
@@ -219,6 +268,7 @@ async def upsert_model_config(
     await db.flush()
     await db.refresh(cfg)
 
+    # LLMService 会缓存最终 Provider 配置，保存后必须删除缓存让新值立即生效。
     from app.core.redis_client import cache_delete
     await cache_delete(f"provider_cfg:{provider}")
 
@@ -235,8 +285,10 @@ async def delete_model_config(
     result = await db.execute(select(ModelConfig).where(ModelConfig.provider == provider))
     cfg = result.scalar_one_or_none()
     if cfg:
+        # 只删除数据库覆盖项，不删除 .env；最终服务配置会自然回退到 settings。
         await db.delete(cfg)
 
+    # 无论数据库行是否存在都清缓存，避免继续使用旧的合并配置。
     from app.core.redis_client import cache_delete
     await cache_delete(f"provider_cfg:{provider}")
 

@@ -1,3 +1,36 @@
+# =============================================================================
+# 文件作用与架构位置（语音转文字 Provider 适配层）
+# =============================================================================
+# 本文件把百度和阿里云不同的 ASR 认证、音频格式和响应结构统一成一个 recognize() 接口。
+# DocumentService 先读取 VoiceConfig，再调用这里取得文字，之后按普通文档分块和向量化。
+#
+# 主要方法和函数：
+#
+#   recognize()              按 provider 分派
+#   _normalize_audio()       用 ffmpeg 转为 16kHz 单声道 PCM
+#   _baidu_asr()             百度 SDK 调用
+#   _aliyun_asr()            阿里云 REST 调用
+#   _generate_aliyun_token() 优先用 SDK 获取 Token
+#   _aliyun_token_direct()   无 SDK 时手工签名获取 Token
+#   recognize_from_config()  从 VoiceConfig ORM 对象调用统一入口
+#   _percent_encode()        阿里云签名需要的 RFC 3986 编码
+#   _sync_call()             百度方法内部的同步 SDK 包装函数
+#
+#   原始音频
+#      |
+#      v
+#   ffmpeg -> 16000Hz / mono / pcm 临时文件
+#      |
+#      +--> 百度 AipSpeech
+#      +--> 阿里 Token + HTTP API
+#      |
+#      v
+#   识别文本 -> 删除临时 PCM -> DocumentService
+#
+# 凭证只用于服务端请求，不应进入日志或返回前端。
+# =============================================================================
+
+# json 处理配置和响应；base64 用于音频/签名编码；hashlib/hmac 用于阿里云签名。
 import json
 import base64
 import hashlib
@@ -9,6 +42,7 @@ from typing import Optional, TYPE_CHECKING
 from app.core.logger import logger
 
 if TYPE_CHECKING:
+    # 只供静态类型检查器读取，运行时不导入 ORM，避免循环依赖。
     from app.models.db import VoiceConfig
 
 
@@ -21,6 +55,7 @@ class VoiceASRService:
         调用指定 Provider 的语音识别 API，返回识别文本。
         支持: baidu (百度), aliyun (阿里云)
         """
+        # extra_params 不同 Provider 含义不同：百度使用 app_id，阿里使用 app_key。
         if provider == "baidu":
             return await VoiceASRService._baidu_asr(file_path, api_key, api_secret, extra_params or {})
         elif provider == "aliyun":
@@ -56,6 +91,7 @@ class VoiceASRService:
 
         # 已是 PCM 且采样率为 16000，跳过
         if ext == "pcm":
+            # 原始 PCM 没有文件头可读取采样率，当前实现直接假定它已符合 16k 单声道要求。
             return file_path
 
         # WAV 需检查采样率，若已是 16kHz 也跳过
@@ -68,6 +104,7 @@ class VoiceASRService:
                     - wf.getnchannels() ：获取声道数（1 单声道）
                     '''
                     if wf.getframerate() == 16000 and wf.getnchannels() == 1:
+                        # 已满足云服务格式要求，无需创建临时文件。
                         return file_path
             except Exception:
                 pass
@@ -95,6 +132,7 @@ class VoiceASRService:
             - timeout=60 ：设置超时时间（秒）
             '''
             result = _subprocess.run(
+                # -y 覆盖输出；-ac 1 单声道；-ar 16000 采样率；s16le 表示 16 位小端 PCM。
                 ["ffmpeg", "-y", "-i", file_path,
                  "-ac", "1", "-ar", "16000",
                  "-acodec", "pcm_s16le", "-f", "s16le",
@@ -102,6 +140,7 @@ class VoiceASRService:
                 capture_output=True, timeout=60,
             )
             if result.returncode != 0:
+                # decode(errors='replace') 保证 ffmpeg 错误字节无法解码时也能生成消息。
                 raise RuntimeError(f"ffmpeg 转换失败: {result.stderr.decode(errors='replace')}")
             logger.info(f"[voice] ffmpeg 转换成功: {file_path} -> {out_pcm}")
             return out_pcm
@@ -141,6 +180,7 @@ class VoiceASRService:
             raise RuntimeError("百度 ASR 配置不完整，请填写 App ID、API Key、Secret Key")
 
         dev_pid = params.get("dev_pid", 1537)
+        # dev_pid 指定百度语言模型，1537 通常对应普通话输入法模型。
 
         # 统一音频格式：转为 16kHz 单声道 PCM，消除格式歧义
         normalized_path = VoiceASRService._normalize_audio(file_path)
@@ -154,8 +194,10 @@ class VoiceASRService:
                 audio_data = f.read()
 
             def _sync_call():
+                # 百度 SDK 的 asr() 是同步阻塞调用。
                 return client.asr(audio_data, fmt, rate, {"dev_pid": dev_pid})
 
+            # asyncio.to_thread 把同步 SDK 放到线程，避免阻塞当前事件循环。
             result = await asyncio.to_thread(_sync_call)
 
             if result.get("err_no"):
@@ -167,11 +209,13 @@ class VoiceASRService:
             if not result_list:
                 logger.warning("[voice] 百度ASR未识别到文字内容（音频可能为空或无声）")
                 raise ValueError("百度ASR未识别到文字内容")
+            # 百度可能返回多个句段，按原顺序拼成最终文字。
             return "".join(result_list)
         finally:
             # 清理临时转换文件
             import os
             if normalized_path != file_path and os.path.exists(normalized_path):
+                # 只删除本函数创建的临时文件，绝不删除用户原始上传文件。
                 try:
                     os.remove(normalized_path)
                 except Exception:
@@ -202,9 +246,11 @@ class VoiceASRService:
         try:
             with open(normalized_path, "rb") as f:
                 audio_data = f.read()
+            # JSON 不能直接包含二进制音频，因此先编码成 Base64 ASCII 字符串。
             audio_base64 = base64.b64encode(audio_data).decode("ascii")
 
             # 生成 Token（简化签名方式，适用于 NLS 1.0）
+            # Token 获取函数是同步实现；当前调用发生在语音处理工作线程中的事件循环。
             token = VoiceASRService._generate_aliyun_token(access_key_id, access_key_secret)
             if not token:
                 logger.error("[voice] 阿里云 Token 生成失败，请检查 AccessKey ID 和 AccessKey Secret 是否正确")
@@ -224,11 +270,13 @@ class VoiceASRService:
             }
 
             async with httpx.AsyncClient(timeout=60) as client:
+                # 真正识别请求使用异步 HTTP，最大等待 60 秒。
                 resp = await client.post(url, headers=headers, json=payload)
 
             if resp.status_code == 401:
                 raise RuntimeError("阿里云 Token 无效或已过期，请重新生成")
             resp.raise_for_status()
+            # 非 2xx 状态会在上一行抛 HTTPStatusError；成功后再解析 JSON。
             data = resp.json()
 
             if data.get("error_code"):
@@ -261,10 +309,12 @@ class VoiceASRService:
             from aliyunsdkcore.profile import region_provider
             from aliyunsdknls.request.v20171225 import CreateTokenRequest
         except ImportError:
+            # SDK 未安装时使用本文件的纯标准库签名实现。
             logger.warning("aliyun-python-sdk-core-nls 未安装，尝试直接生成签名 Token")
             return VoiceASRService._aliyun_token_direct(access_key_id, access_key_secret)
 
         try:
+            # cn-shanghai 与后续 NLS 网关区域保持一致。
             client = AcsClient(access_key_id, access_key_secret, "cn-shanghai")
             request = CreateTokenRequest.CreateTokenRequest()
             response = client.do_action_with_exception(request)
@@ -279,6 +329,7 @@ class VoiceASRService:
         """
         直接构造签名方式获取 Token（无 SDK 备用方案）。
         """
+        # 毫秒时间戳和随机性 nonce 用于防止签名请求重放。
         timestamp = int(time.time() * 1000)
         nonce = hashlib.md5(str(timestamp).encode()).hexdigest()[:16]
 
@@ -292,9 +343,11 @@ class VoiceASRService:
             "Timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(timestamp / 1000)),
             "Version": "2019-07-07",
         }
+        # 阿里签名要求参数按键排序、逐项百分号编码，再构造待签名字符串。
         sorted_params = sorted(params.items())
         canonical = "&".join(f"{k}={_percent_encode(str(v))}" for k, v in sorted_params)
         string_to_sign = f"GET&%2F&{_percent_encode(canonical)}"
+        # 使用 AccessKeySecret + '&' 作为 HMAC-SHA1 密钥，并将摘要 Base64 编码。
         sig = base64.b64encode(
             hmac.new(
                 (access_key_secret + "&").encode(),
@@ -308,16 +361,19 @@ class VoiceASRService:
         token_url = f"https://nls-gateway-cn-shanghai.aliyuncs.com/?{query}"
 
         try:
+            # urllib 是同步请求；这里作为无 SDK 的低频备用路径。
             import urllib.request
             with urllib.request.urlopen(token_url, timeout=10) as r:
                 data = json.loads(r.read())
                 return data.get("Token", {}).get("Id", "")
         except Exception:
+            # 获取失败时返回空字符串，上层会转换成清晰的 Token 生成失败错误。
             return ""
 
     @staticmethod
     async def recognize_from_config(file_path: str, cfg: "VoiceConfig") -> str:
         """根据 VoiceConfig 记录执行语音识别"""
+        # 数据库 extra_params 是 JSON 字符串，先还原成 Provider 参数字典。
         extra = json.loads(cfg.extra_params) if cfg.extra_params else {}
         text = await VoiceASRService.recognize(
             file_path=file_path,
@@ -333,4 +389,5 @@ class VoiceASRService:
 def _percent_encode(val: str) -> str:
     """URL Percent Encode (RFC 3986)"""
     import urllib.parse
+    # safe="" 表示斜杠等保留字符也全部编码，符合签名规范要求。
     return urllib.parse.quote(str(val), safe="")

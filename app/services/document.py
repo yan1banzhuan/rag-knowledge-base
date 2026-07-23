@@ -1,3 +1,50 @@
+# =============================================================================
+# 文件作用与架构位置（文档入库流水线核心服务）
+# =============================================================================
+# 本文件把已经上传并登记为 processing 的 Document 转换为可检索数据。它同时协调文件
+# 解析、文本分块、Embedding、ChromaDB、MySQL DocumentChunk、语音 ASR 和缓存失效。
+#
+# 本文件有 12 个函数/方法和 1 个服务类：
+#
+#   _get_process_pool()       创建并复用后台线程池
+#   _is_markdown_content()    通过内容判断是否像 Markdown
+#   _chunk_markdown()         Markdown 标题感知分块
+#   _sync_process_doc()       普通文档同步处理主流程
+#   _sync_process_audio_doc() ASR 文字的同步分块入库流程
+#   _run_async_in_thread()    在线程中运行 async 协程
+#   _sync_voice_asr()         线程中的语音识别包装
+#   _do_voice_asr()           ASGI 事件循环调用 ASR 的 async 包装
+#   DocumentService._get_voice_config() 选择已启用 ASR 配置
+#   DocumentService.process_document()  路由调用的总入口
+#   _invalidate_bm25_cache()  文档变化后删除关键词索引缓存
+#   _mark_failed_async()      将失败状态和错误写回数据库
+#
+# 普通文档入库：
+#
+#   Document(file_path, processing)
+#       |
+#       v
+#   get_parser -> ParsedDocument -> 按页面/Block/Markdown 标题分块
+#       |
+#       v
+#   [chunk text] -> EmbeddingService -> [vector]
+#       |                                  |
+#       |                                  v
+#       +--> MySQL document_chunks      ChromaDB kb_{id}
+#       |
+#       v
+#   Document.status=completed + chunk_count + KB.doc_count
+#       |
+#       v
+#   删除 BM25 缓存，下次检索重新构建
+#
+# 音频流程在解析前多一步 VoiceASRService，把音频先变成 asr_text。
+#
+# 为什么使用线程池？解析、模型推理和同步数据库/文件库操作可能阻塞；把它们放到工作线程
+# 后，FastAPI 主事件循环仍能响应其他 HTTP 请求。
+# =============================================================================
+
+# uuid 用于生成 Chroma chunk 唯一 ID；os 用于 CPU 数量和路径相关操作。
 import uuid
 import os
 from concurrent.futures import ThreadPoolExecutor
@@ -11,6 +58,7 @@ from app.core.config import settings
 from app.core.logger import logger
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
+# 虽然变量名叫 process_pool，实际对象是 ThreadPoolExecutor（线程池而非进程池）。
 _process_pool = None
 
 
@@ -18,6 +66,7 @@ def _get_process_pool():
     """获取线程池（CPU 核数 - 1 个 worker，最少 2 个）"""
     global _process_pool
     if _process_pool is None:
+        # 默认保留约一个 CPU 核给主进程，但至少创建 2 个 worker。
         workers = max(2, (os.cpu_count() or 4) - 1)
         _process_pool = ThreadPoolExecutor(max_workers=workers)
         logger.info(f"文档处理线程池已创建，workers={workers}")
@@ -34,12 +83,14 @@ def _is_markdown_content(text: str) -> bool:
     用于 file_type 未能正确标记时的兜底检测。
     """
     import re
+    # 只检查前 30 行，足够识别文档结构且避免扫描整份长文本。
     lines = text.strip().split("\n")
     head = lines[:30]  # 取前 30 行判断
     heading_count = sum(1 for line in head if re.match(r"^#{1,4}\s", line))
     if heading_count >= 2:
         return True
     if heading_count == 1:
+        # 只有一个标题时，再要求至少两个列表项，降低普通文本以 # 开头造成的误判。
         list_count = sum(
             1 for line in head
             if re.match(r"^\s*[-*+]\s", line) or re.match(r"^\s*\d+[\.\)]\s", line)
@@ -62,6 +113,7 @@ def _chunk_markdown(text: str) -> list:
     from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
 
     # 一级：按标题层级切分
+    # 第一层尽量让每个 chunk 对应一个标题章节，并把标题层级保存在 metadata。
     header_splitter = MarkdownHeaderTextSplitter(
         headers_to_split_on=[
             ("#", "h1"),
@@ -74,6 +126,7 @@ def _chunk_markdown(text: str) -> list:
     header_docs = header_splitter.split_text(text)
 
     # 二级：超大块二次切分
+    # 标题章节仍可能过长，第二层按通用分隔符递归拆分。
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=settings.CHUNK_SIZE,
         chunk_overlap=min(settings.CHUNK_OVERLAP, 50),
@@ -86,6 +139,7 @@ def _chunk_markdown(text: str) -> list:
         if not content:
             continue
         if len(content) <= settings.CHUNK_SIZE:
+            # 小章节直接保留完整结构。
             result.append((content, dict(doc.metadata)))
         else:
             sub_splits = text_splitter.split_text(content)
@@ -110,6 +164,7 @@ def _sync_process_doc(doc_id: int):
     from langchain_text_splitters import RecursiveCharacterTextSplitter
     import uuid as _uuid
 
+    # 线程内不能复用 FastAPI 的 AsyncSession，因此创建独立同步 Session。
     session = Session(sync_engine)
     try:
         doc = session.execute(
@@ -122,6 +177,7 @@ def _sync_process_doc(doc_id: int):
         logger.info(f"[线程池] 开始处理文档 [{doc_id}]: {doc.filename}")
 
         # 1. 解析文档
+        # get_parser 根据 file_type 选择 PDF/Word/Excel/Text/Image 等解析器。
         parser = get_parser(doc.file_type)
         parsed = parser.parse(doc.file_path)
 
@@ -141,6 +197,7 @@ def _sync_process_doc(doc_id: int):
             if not raw_text.strip():
                 return False, "文档内容为空"
             md_result = _chunk_markdown(raw_text)
+            # 统一形成 (内容, 页码, 来源类型) 三元组；Markdown 当前统一使用页码 1。
             all_chunks = [(content, 1, "markdown") for content, _ in md_result]
             md_heading_metas = [meta for _, meta in md_result]
             logger.info(f"[线程池] Markdown 文档 [{doc_id}]，按标题切分为 {len(all_chunks)} 块")
@@ -186,6 +243,7 @@ def _sync_process_doc(doc_id: int):
         logger.info(f"[线程池] 文档 [{doc_id}] 分块完成，共 {len(all_chunks)} 块")
 
         # 3. 向量化
+        # texts 的顺序必须与 all_chunks 一致，后面通过 zip 把每个向量配回原文本块。
         texts = [c[0] for c in all_chunks]
         embeddings = EmbeddingService.embed_texts(texts)
 
@@ -195,6 +253,7 @@ def _sync_process_doc(doc_id: int):
         db_chunks = []
 
         for i, ((content, page_num, source_type), embedding) in enumerate(zip(all_chunks, embeddings)):
+            # ID 包含文档、块序号和随机后缀，减少重新处理或并发任务时发生冲突。
             chroma_id = f"doc{doc_id}_chunk{i}_{_uuid.uuid4().hex[:8]}"
             chroma_ids.append(chroma_id)
             chroma_metadatas.append({
@@ -209,6 +268,7 @@ def _sync_process_doc(doc_id: int):
             })
             # Markdown：合并标题层级元数据（h1/h2/h3/h4）
             if is_md and i < len(md_heading_metas):
+                # 把 h1/h2 等标题加入 Chroma metadata，便于未来过滤或显示章节来源。
                 chroma_metadatas[-1].update({
                     k: v for k, v in md_heading_metas[i].items() if v
                 })
@@ -219,6 +279,7 @@ def _sync_process_doc(doc_id: int):
                 content=content,
                 chunk_index=i,
                 page_num=page_num,
+                # 当前 token_count 实际保存字符长度，并非模型 tokenizer 的真实 Token 数。
                 token_count=len(content),
             ))
 
@@ -232,10 +293,12 @@ def _sync_process_doc(doc_id: int):
         )
 
         # 6. 写入 MySQL chunks
+        # Chroma 和 MySQL 不共享事务：Chroma 已成功但后续数据库提交失败时，可能留下孤立向量。
         for chunk in db_chunks:
             session.add(chunk)
 
         # 更新文档状态
+        # 全部数据准备完毕后才把文档标记为完成。
         doc.status = DocumentStatus.completed
         doc.chunk_count = len(all_chunks)
 
@@ -244,6 +307,7 @@ def _sync_process_doc(doc_id: int):
             select(KnowledgeBase).where(KnowledgeBase.id == doc.kb_id)
         ).scalar_one_or_none()
         if kb:
+            # 每次成功处理都会 +1；重新处理已有成功文档时，现有逻辑可能重复增加计数。
             kb.doc_count = (kb.doc_count or 0) + 1
 
         session.commit()
@@ -251,6 +315,7 @@ def _sync_process_doc(doc_id: int):
         return True, len(all_chunks)
 
     except Exception as e:
+        # 回滚本同步 MySQL 会话，并把用户可见错误写回 Document。
         session.rollback()
         err_msg = str(e)
         if "未识别到文字内容" in err_msg or "图片文件无效" in err_msg or "图片中未识别到文字" in err_msg:
@@ -268,6 +333,7 @@ def _sync_process_doc(doc_id: int):
         return False, err_msg
 
     finally:
+        # 无论成功或失败都释放数据库连接。
         session.close()
 
 
@@ -282,6 +348,7 @@ def _sync_process_audio_doc(doc_id: int, asr_text: str):
     from langchain_text_splitters import RecursiveCharacterTextSplitter
     import uuid as _uuid
 
+    # 该函数不再读取音频本身，只把已识别的 asr_text 按普通文本分块和向量化。
     session = Session(sync_engine)
     try:
         doc = session.execute(
@@ -337,6 +404,7 @@ def _sync_process_audio_doc(doc_id: int, asr_text: str):
         )
 
         for i, (content, page_num, _) in enumerate(all_chunks):
+            # chroma_ids 与 all_chunks 使用同一索引，确保两种存储可以互相定位。
             session.add(DocumentChunk(
                 doc_id=doc_id,
                 kb_id=doc.kb_id,
@@ -379,6 +447,7 @@ def _sync_process_audio_doc(doc_id: int, asr_text: str):
 def _run_async_in_thread(coro):
     """在当前线程中运行协程（用于 ThreadPoolExecutor 中调用 async 函数）"""
     try:
+        # 工作线程通常没有事件循环；若有则尝试复用。
         loop = asyncio.get_event_loop()
         if loop.is_running():
             # 已有事件循环，直接运行
@@ -405,6 +474,7 @@ def _sync_voice_asr(doc_id: int, provider: str, api_key: str, api_secret: str, e
     from sqlalchemy import select
 
     # 从 DB 读取文件路径
+    # 先用短生命周期同步会话取得磁盘文件路径，然后立即关闭数据库连接。
     session = Session(sync_engine)
     try:
         doc = session.execute(select(Document).where(Document.id == doc_id)).scalar_one_or_none()
@@ -417,6 +487,7 @@ def _sync_voice_asr(doc_id: int, provider: str, api_key: str, api_secret: str, e
 
     # 构造协程，在新线程的事件循环中运行
     async def _do():
+        # provider 和凭证已在 async 主入口中校验，这里只发起实际识别。
         return await VoiceASRService.recognize(
             file_path=file_path,
             provider=provider,
@@ -435,6 +506,7 @@ def _sync_voice_asr(doc_id: int, provider: str, api_key: str, api_secret: str, e
 async def _do_voice_asr(doc_id: int, provider: str, api_key: str, api_secret: str, extra: dict) -> str:
     """在事件循环中调用，在线程池执行同步 ASR"""
     loop = asyncio.get_running_loop()
+    # 使用单 worker 临时线程池运行同步包装器，避免 ASR 网络/轮询细节阻塞当前事件循环。
     return await loop.run_in_executor(
         ThreadPoolExecutor(max_workers=1),
         _sync_voice_asr,
@@ -452,6 +524,7 @@ class DocumentService:
     async def _get_voice_config(doc_id: int) -> dict:
         """查询已启用的语音配置"""
         from app.models.db import VoiceConfig
+        # doc_id 当前没有参与查询；函数选择“已启用且默认优先”的第一条全局 VoiceConfig。
         async with AsyncSessionLocal() as db:
             result = await db.execute(
                 select(VoiceConfig)
@@ -460,6 +533,7 @@ class DocumentService:
                 .limit(1)
             )
             cfg = result.scalar_one_or_none()
+        # 会话关闭后 cfg 成为脱离会话的 ORM 对象，但已加载的标量字段仍可读取。
         return cfg
 
     @staticmethod
@@ -469,10 +543,12 @@ class DocumentService:
         流程：查询文档信息 → 路由到线程池执行 CPU 密集型任务。
         事件循环始终保持空闲，不阻塞其他请求。
         """
+        # 本函数由 asyncio.create_task 调度，因此这里能取得当前 ASGI 事件循环。
         loop = asyncio.get_running_loop()
         pool = _get_process_pool()
 
         # 查询文档基本信息
+        # 只读取路由判断所需的轻量字段，离开上下文后立即释放连接。
         async with AsyncSessionLocal() as db:
             result = await db.execute(select(Document).where(Document.id == doc_id))
             doc = result.scalar_one_or_none()
@@ -486,12 +562,14 @@ class DocumentService:
 
         if file_type.lower() in AUDIO_TYPES:
             # 语音文件：先 ASR，再进线程池处理
+            # 音频必须先找到完整且启用的 Provider 配置。
             cfg = await DocumentService._get_voice_config(doc_id)
             if not cfg:
                 await _mark_failed_async(doc_id, "未找到已启用的语音识别配置，请前往「语音配置」页面添加并启用")
                 return
 
             import json as _json
+            # extra_params 保存百度 app_id 或阿里 app_key 等 Provider 特有字段。
             extra = _json.loads(cfg.extra_params) if cfg.extra_params else {}
 
             # 验证配置完整性
@@ -515,6 +593,7 @@ class DocumentService:
             # ASR 文本进线程池处理（分块+向量化）
             try:
                 await loop.run_in_executor(pool, _sync_process_audio_doc, doc_id, asr_text)
+                # 工作线程操作持久化 Chroma 后，重建主线程客户端以刷新可见状态。
                 VectorStore._client = None
                 VectorStore.get_client()
                 await _invalidate_bm25_cache(kb_id)
@@ -522,6 +601,7 @@ class DocumentService:
                 await _mark_failed_async(doc_id, str(e))
         else:
             try:
+                # run_in_executor 返回可等待对象；事件循环等待结果期间仍可调度其他请求。
                 await loop.run_in_executor(pool, _sync_process_doc, doc_id)
                 VectorStore._client = None
                 VectorStore.get_client()
@@ -537,6 +617,7 @@ async def _invalidate_bm25_cache(kb_id: int):
         await cache_delete(f"kb:{kb_id}:bm25")
         logger.debug(f"BM25 缓存已失效: kb_id={kb_id}")
     except Exception:
+        # Redis 只做缓存，失效失败不改变文档已经成功入库的事实。
         pass
 
 
@@ -545,12 +626,15 @@ async def _mark_failed_async(doc_id: int, err_msg: str):
     if "未识别到文字内容" in err_msg or "图片文件无效" in err_msg or "图片中未识别到文字" in err_msg:
         err_msg = "图片中未识别到文字内容，无法入库，请上传包含文字的图片"
     try:
+        # 使用独立异步会话写入失败状态，不依赖调用方原来的请求会话。
         async with AsyncSessionLocal() as db:
             result = await db.execute(select(Document).where(Document.id == doc_id))
             doc = result.scalar_one_or_none()
             if doc:
                 doc.status = DocumentStatus.failed
+                # 数据库字段长度有限，只保存前 500 个字符。
                 doc.error_msg = err_msg[:500]
                 await db.commit()
     except Exception:
+        # 最后的错误记录也失败时静默结束，避免后台 Task 产生未处理异常。
         pass

@@ -1,3 +1,44 @@
+# =============================================================================
+# 文件作用与架构位置（RBAC 角色与权限管理路由）
+# =============================================================================
+# 本文件实现基于角色的访问控制（RBAC）管理。用户不直接绑定大量权限，而是先绑定角色，
+# 角色再通过 role_permissions 关联菜单权限或知识库资源权限。
+#
+# 数据关系：
+#
+#   User --< UserRole >-- Role --< RolePermission >-- Permission
+#                                                    |
+#                               +--------------------+------------------+
+#                               |                                       |
+#                       type="menu"                              type="kb"
+#                    code="chat" 等                          code="kb:17" 等
+#
+# 本文件有 13 个函数和 3 个请求模型类：
+#
+#   缓存/转换辅助：_invalidate_perm_cache、_extract_kb_ids、_build_role_out、
+#                 _get_role_with_perms
+#   角色 CRUD：list_roles、get_role、create_role、update_role、delete_role
+#   权限读取：list_all_permissions
+#   权限更新：update_role_menu_permissions、update_role_permissions、
+#             update_role_kb_permissions
+#   请求模型：RoleMenuPermissionUpdate、RolePermissionUpdate、RoleKbPermissionUpdate
+#
+# 权限修改流程：
+#
+#   校验角色存在且不是超级管理员角色
+#       |
+#   校验 permission_ids / kb_ids 都真实存在
+#       |
+#   删除目标类型的旧 RolePermission
+#       |
+#   创建新的 RolePermission，必要时动态创建 Permission(code="kb:{id}")
+#       |
+#   flush -> 重新加载角色 -> 清除全部用户权限缓存 -> 返回
+#
+# 为什么清缓存？用户最终权限是由角色实时聚合后缓存在 Redis 的；角色权限发生变化时，
+# 不知道哪些用户绑定了该角色，最简单安全的做法是清除全部用户权限缓存。
+# =============================================================================
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
@@ -17,20 +58,25 @@ router = APIRouter(prefix="/roles", tags=["角色管理"])
 
 
 async def _invalidate_perm_cache():
+    # 用局部导入避免 deps.py 与 role.py 在模块加载阶段形成循环依赖。
     try:
         from app.api.deps import invalidate_all_permission_cache
         await invalidate_all_permission_cache()
     except Exception:
+        # Redis 缓存清理失败不阻止数据库权限变更；缓存最终还会因 TTL 过期。
         pass
 
 # 从角色权限中提取知识库ID
 def _extract_kb_ids(permissions: list) -> list[int]:
+    # 把 Permission(type="kb", code="kb:17") 转成整数 17，供前端知识库选择器使用。
     kb_ids = []
     for p in permissions:
         if p.type == "kb" and p.code.startswith("kb:"):
             try:
+                # split(':')[1] 取得冒号后的 ID 字符串，再转换成 int。
                 kb_ids.append(int(p.code.split(":")[1]))
             except (ValueError, IndexError):
+                # 格式异常的权限不让整个角色响应失败，直接跳过。
                 pass
     return kb_ids
 
@@ -38,6 +84,7 @@ def _extract_kb_ids(permissions: list) -> list[int]:
 # ===== Helpers =====
 # 构建角色输出模型，包含知识库权限ID
 def _build_role_out(role: Role, kb_ids: list[int] = None) -> RoleWithKbIds:
+    # ORM Role 不能直接无控制地返回；这里显式转换角色字段、权限 Schema 和知识库 ID。
     return RoleWithKbIds(
         id=role.id,
         name=role.name,
@@ -50,6 +97,7 @@ def _build_role_out(role: Role, kb_ids: list[int] = None) -> RoleWithKbIds:
 
 
 async def _get_role_with_perms(db: AsyncSession, role_id: int) -> Role:
+    # selectinload 在异步查询阶段预加载 permissions，避免响应转换时隐式访问数据库。
     result = await db.execute(
         select(Role)
         .options(selectinload(Role.permissions))
@@ -69,6 +117,7 @@ async def list_roles(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_permission(PermissionCode.ROLE_MANAGE)),
 ):
+    # COUNT 统计全部角色；列表查询再应用分页和创建时间倒序。
     total = await db.scalar(select(func.count()).select_from(Role))
     result = await db.execute(
         select(Role)
@@ -80,6 +129,7 @@ async def list_roles(
     roles = result.unique().scalars().all()
 
     # permissions 已通过 selectinload 加载，无需 refresh
+    # 每个角色同时返回完整 PermissionOut 列表和便于前端勾选的 kb_permission_ids。
     data = [_build_role_out(role, _extract_kb_ids(role.permissions)) for role in roles]
 
     return PageResp(data=data, total=total, page=page, page_size=page_size)
@@ -92,6 +142,7 @@ async def get_role(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_permission(PermissionCode.ROLE_MANAGE)),
 ):
+    # 共享辅助函数已经完成 404 处理和权限关系预加载。
     role = await _get_role_with_perms(db, role_id)
 
     # 获取该角色关联的知识库权限（type=kb 的权限，其 code 格式为 "kb:{kb_id}"）
@@ -101,6 +152,7 @@ async def get_role(
             try:
                 kb_ids.append(int(p.code.split(":")[1]))
             except ValueError:
+                # 无法转换成整数的异常权限编码不进入返回列表。
                 pass
 
     return Resp(data=_build_role_out(role, kb_ids))
@@ -118,9 +170,11 @@ async def create_role(
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=400, detail="角色名称已存在")
 
+    # API 创建的普通角色固定 is_admin=False，不能通过请求体创建超级管理员角色。
     role = Role(name=body.name, description=body.description, is_admin=False)
     db.add(role)
     await db.flush()
+    # 新角色当前没有权限，但重新查询可保证响应对象关系处于已加载状态。
     role = await _get_role_with_perms(db, role.id)
     await _invalidate_perm_cache()
     return Resp(data=_build_role_out(role), message="角色创建成功")
@@ -138,6 +192,7 @@ async def update_role(
 
     # 禁止修改超级管理员角色
     if role.is_admin:
+        # 超级管理员角色是系统安全根角色，禁止通过普通管理接口修改。
         raise HTTPException(status_code=403, detail="禁止修改超级管理员角色")
 
     if body.name is not None:
@@ -173,6 +228,7 @@ async def delete_role(
         select(func.count()).select_from(UserRole).where(UserRole.role_id == role_id)
     )
     if user_count and user_count > 0:
+        # 先要求管理员解除用户关联，避免删除仍在使用的角色导致权限关系突然消失。
         raise HTTPException(status_code=400, detail=f"该角色已被 {user_count} 个用户使用，请先解除关联后再删除")
 
     await db.delete(role)
@@ -186,6 +242,7 @@ async def list_all_permissions(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_permission(PermissionCode.ROLE_MANAGE)),
 ):
+    # Permission 表中保存稳定的菜单权限，以及已动态创建的 kb:{id} 权限记录。
     result = await db.execute(select(Permission).order_by(Permission.type, Permission.id))
     permissions = result.scalars().all()
 
@@ -193,8 +250,10 @@ async def list_all_permissions(
     menu_perms = [PermissionOut.model_validate(p) for p in permissions if p.type == "menu"]
     # kb 类型的权限动态构建：管理员返回全部知识库，普通用户返回自己拥有 + 角色授权的
     if current_user.is_admin:
+        # 管理员可以给角色分配任意知识库。
         kbs_result = await db.execute(select(KnowledgeBase).order_by(KnowledgeBase.created_at.desc()))
     else:
+        # 普通角色管理员只能分配自己拥有或自己已获授权的知识库，避免权限越权扩散。
         user_kb_ids = await get_user_kb_ids(db, current_user)
         kbs_result = await db.execute(
             select(KnowledgeBase)
@@ -205,6 +264,7 @@ async def list_all_permissions(
             .order_by(KnowledgeBase.created_at.desc())
         )
     kbs = kbs_result.scalars().all()
+    # 知识库选择项直接由 KnowledgeBase 构建，而不是依赖 Permission 表中是否已有 kb:id 行。
     kb_perms = [{"kb_id": kb.id, "kb_name": kb.name} for kb in kbs]
 
     return Resp(data={"menu_permissions": menu_perms, "kb_permissions": kb_perms})
@@ -212,6 +272,7 @@ async def list_all_permissions(
 
 # ===== 更新角色菜单权限（不操作知识库权限）=====
 class RoleMenuPermissionUpdate(BaseModel):
+    # 请求示例：{"permission_ids": [1, 2, 5]}。
     permission_ids: list[int] = []
 
 # 更新角色菜单权限（不操作知识库权限）
@@ -232,9 +293,11 @@ async def update_role_menu_permissions(
     valid_perms_result = await db.execute(select(Permission).where(Permission.id.in_(body.permission_ids)))
     valid_perms = list(valid_perms_result.scalars().all())
     if len(valid_perms) != len(body.permission_ids):
+        # 查询数量与请求数量不同，说明存在无效 ID（重复 ID 也可能造成数量不一致）。
         raise HTTPException(status_code=400, detail="包含无效的权限 ID")
 
     # 删除旧的菜单类型角色-权限关联（保留 kb 类型）
+    # join Permission 是为了根据 Permission.type 筛选关联表行。
     old_rps = await db.execute(
         select(RolePermission)
         .join(Permission, Permission.id == RolePermission.permission_id)
@@ -245,6 +308,7 @@ async def update_role_menu_permissions(
 
     # 新增菜单权限关联
     for perm in valid_perms:
+        # RolePermission 是多对多中间表的一行。
         db.add(RolePermission(role_id=role_id, permission_id=perm.id))
 
     await db.flush()
@@ -255,6 +319,7 @@ async def update_role_menu_permissions(
 
 # ===== 更新角色权限 =====
 class RolePermissionUpdate(BaseModel):
+    # 组合接口同时接收菜单权限 ID 和知识库 ID。
     permission_ids: list[int] = []
     kb_ids: list[int] = []  # 知识库权限
 
@@ -285,6 +350,8 @@ async def update_role_permissions(
         raise HTTPException(status_code=400, detail="包含无效的知识库 ID")
 
     # 删除旧的菜单类型角色-权限关联（保留 kb 类型）
+    # 注意这是当前代码的真实行为：这里只删除旧 menu 关联，已有 kb 关联会保留；
+    # 随后请求中的 kb_ids 会继续新增。若要“全量替换知识库权限”，应调用下面独立接口。
     old_rps = await db.execute(
         select(RolePermission)
         .join(Permission, Permission.id == RolePermission.permission_id)
@@ -304,6 +371,7 @@ async def update_role_permissions(
         perm_result = await db.execute(select(Permission).where(Permission.code == kb_code))
         kb_perm = perm_result.scalar_one_or_none()
         if kb_perm is None:
+            # 知识库资源权限按需创建，无需为每个 KB 在初始化时提前建立 Permission。
             kb_perm = Permission(code=kb_code, name=f"知识库{kb_id}访问权限", type="kb")
             db.add(kb_perm)
             await db.flush()
@@ -317,6 +385,7 @@ async def update_role_permissions(
 
 # ===== 独立：更新角色知识库权限（不操作菜单权限）=====
 class RoleKbPermissionUpdate(BaseModel):
+    # 此接口只替换知识库权限，不触碰菜单权限。
     kb_ids: list[int]
 
 # 更新角色知识库权限（不操作菜单权限）
@@ -335,6 +404,7 @@ async def update_role_kb_permissions(
 
     # 验证 kb_ids 合法
     if body.kb_ids:
+        # 空列表表示清空全部知识库权限，不需要执行 IN 查询。
         valid_kbs_result = await db.execute(
             select(KnowledgeBase).where(KnowledgeBase.id.in_(body.kb_ids))
         )
@@ -343,6 +413,7 @@ async def update_role_kb_permissions(
             raise HTTPException(status_code=400, detail="包含无效的知识库 ID")
 
     # 删除该角色所有 kb 类型的角色-权限关联
+    # 与组合接口不同，这里先完整删除旧 kb 关联，所以最终结果严格等于 body.kb_ids。
     old_rps = await db.execute(
         select(RolePermission)
         .join(Permission, Permission.id == RolePermission.permission_id)
@@ -365,4 +436,5 @@ async def update_role_kb_permissions(
     await db.flush()
     role = await _get_role_with_perms(db, role_id)
     await _invalidate_perm_cache()
+    # 返回请求中的 kb_ids，方便前端立即更新勾选状态。
     return Resp(data=_build_role_out(role, body.kb_ids), message="知识库权限已更新")

@@ -1,9 +1,46 @@
+# =============================================================================
+# 文件作用与架构位置（零基础导读）
+# =============================================================================
+# 本文件是整个后端的“配置中心”。其他模块不需要分别读取环境变量，而是统一导入
+# settings，从中取得数据库地址、缓存开关、模型名称、上传限制和检索参数。
+#
+# 配置来源和使用流程：
+#
+#   类字段中的默认值
+#          +
+#   项目根目录 .env / 系统环境变量（同名配置会覆盖默认值）
+#          |
+#          v
+#   Settings() 由 Pydantic 校验并转换类型
+#          |
+#          v
+#   全局 settings 对象
+#          |
+#          +--> db/session.py        数据库连接
+#          +--> redis_client.py      Redis 连接
+#          +--> security.py          JWT 密钥和有效期
+#          +--> services/*           模型、检索和文件参数
+#
+# 本文件有 1 个配置类和 3 个只读属性方法：
+#
+#   Settings.cors_origins_list  把逗号分隔的 CORS 字符串转换为列表
+#   Settings.DATABASE_URL       生成 SQLAlchemy 异步 MySQL URL
+#   Settings.DATABASE_URL_SYNC  生成同步 MySQL URL，供同步工具或迁移场景使用
+#
+# 文件末尾会创建 settings，并确保上传目录和 ChromaDB 目录存在。因此导入此模块不仅
+# 定义类型，也会进行一次轻量的配置初始化和目录检查。
+# =============================================================================
+
+# BaseSettings 自动读取环境变量和 .env；field_validator 当前未使用，保留为配置校验扩展。
 from pydantic_settings import BaseSettings
 from pydantic import field_validator
+# Optional[str] 表示 API Key 等配置允许没有设置，即值可以是字符串或 None。
 from typing import Optional
+# os 用于在启动时创建上传和向量数据库目录。
 import os
 
 
+# Settings 中的类型标注同时承担默认值、类型转换和配置文档三种作用。
 class Settings(BaseSettings):
     # 应用
     APP_ENV: str = "development"
@@ -15,6 +52,8 @@ class Settings(BaseSettings):
 
     @property
     def cors_origins_list(self) -> list[str]:
+        # 例如 "http://a.com, http://b.com" -> ["http://a.com", "http://b.com"]。
+        # strip() 去掉每项两侧空格；最后的 if 会忽略连续逗号形成的空项。
         return [o.strip() for o in self.CORS_ORIGINS.split(",") if o.strip()]
 
     # 速率限制
@@ -41,6 +80,8 @@ class Settings(BaseSettings):
     # 例如：settings.DATABASE_URL 而不是 settings.DATABASE_URL()
     @property
     def DATABASE_URL(self) -> str:
+        # aiomysql 是异步驱动，与项目中的 AsyncSession 配套使用。
+        # 多个相邻 f-string 会由 Python 自动拼接成一个完整字符串。
         return (
             f"mysql+aiomysql://{self.MYSQL_USER}:{self.MYSQL_PASSWORD}"
             f"@{self.MYSQL_HOST}:{self.MYSQL_PORT}/{self.MYSQL_DATABASE}"
@@ -49,6 +90,7 @@ class Settings(BaseSettings):
 
     @property
     def DATABASE_URL_SYNC(self) -> str:
+        # pymysql 是同步驱动。该 URL 与上面的数据库参数相同，仅驱动名称不同。
         return (
             f"mysql+pymysql://{self.MYSQL_USER}:{self.MYSQL_PASSWORD}"
             f"@{self.MYSQL_HOST}:{self.MYSQL_PORT}/{self.MYSQL_DATABASE}"
@@ -115,11 +157,16 @@ class Settings(BaseSettings):
     CHUNK_SIZE: int = 512
     CHUNK_OVERLAP: int = 80
 
+    # env_file 指定配置文件；extra="ignore" 表示 .env 中出现未在 Settings 声明的键时忽略，
+    # 而不是让应用因为无关环境变量而启动失败。
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
 
+# 模块首次导入时创建全局唯一配置对象。后续 `from app.core.config import settings` 得到的
+# 都是这个对象，不需要反复读取和解析 .env。
 settings = Settings()
 
 # 确保必要目录存在
+# exist_ok=True 表示目录已存在时不报错；父目录不存在时 os.makedirs 会一并创建。
 os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
 os.makedirs(settings.CHROMA_PERSIST_DIR, exist_ok=True)
